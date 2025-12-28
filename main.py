@@ -1,6 +1,6 @@
 import sqlite3
 import re
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -8,7 +8,7 @@ from telegram.ext import (
     MessageHandler, ContextTypes, filters
 )
 
-TOKEN = "8385307802:AAE0AJGb8T9RQauVVpLzmFKR1jchrcVZR2c"
+TOKEN = "ВСТАВЬ_СВОЙ_TOKEN"
 MOSCOW = ZoneInfo("Europe/Moscow")
 DEFAULT_REGION = "797"
 
@@ -18,7 +18,7 @@ PRICE_DAY = {
     "Проверка": 93,
     "Подкачка": 63
 }
-PRICE_NIGHT = PRICE_DAY.copy()  # Можно настроить другие цены для ночи
+PRICE_NIGHT = PRICE_DAY.copy()  # Можно задать разные цены для ночи
 
 def get_price(service_name: str, dt: datetime) -> int:
     if 21 <= dt.hour or dt.hour < 9:
@@ -88,6 +88,9 @@ def main_menu(shift_opened: bool):
     else:
         keyboard.append([InlineKeyboardButton("Закрыть смену", callback_data="close_shift")])
     keyboard.append([InlineKeyboardButton("Записать машину", callback_data="record_car")])
+    if shift_opened:
+        keyboard.append([InlineKeyboardButton("Итоги текущей смены", callback_data="shift_summary")])
+        keyboard.append([InlineKeyboardButton("Список машин за сегодня", callback_data="today_cars")])
     keyboard.append([InlineKeyboardButton("Отчёты", callback_data="reports")])
     keyboard.append([InlineKeyboardButton("История смен", callback_data="shift_history")])
     return InlineKeyboardMarkup(keyboard)
@@ -185,7 +188,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                           (car_id, service_name, 1, price, price, now))
             conn.commit()
 
-        # Обновляем сообщение
+        # Обновляем сообщение карточки машины
         c.execute("SELECT car_number FROM cars WHERE id=?", (car_id,))
         car_number = c.fetchone()[0]
         c.execute("SELECT service_name, quantity, total_sum FROM services WHERE car_id=?", (car_id,))
@@ -215,9 +218,71 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(text, reply_markup=services_menu(context.user_data["delete_mode"]))
 
     elif query.data == "car_done":
-        context.user_data.pop("current_car_id", None)
+        car_id = context.user_data.pop("current_car_id", None)
         context.user_data["delete_mode"] = False
-        await query.edit_message_text("Машина завершена.", reply_markup=main_menu(True))
+        if car_id:
+            c.execute("SELECT car_number FROM cars WHERE id=?", (car_id,))
+            car_number = c.fetchone()[0]
+            c.execute("SELECT service_name, quantity, total_sum FROM services WHERE car_id=?", (car_id,))
+            services = c.fetchall()
+            text = f"Машина записана:\n{car_number}\n\nУслуги:\n"
+            total_all = 0
+            for sname, qty, tsum in services:
+                text += f"- {sname} ({qty}): {tsum}₽\n"
+                total_all += tsum
+            text += f"\nИтого: {total_all}₽"
+            await query.message.reply_text(text)
+        await query.edit_message_text("Выберите действие:", reply_markup=main_menu(True))
+
+    elif query.data == "shift_summary":
+        if not shift_opened:
+            await query.edit_message_text("Нет активной смены.", reply_markup=main_menu(False))
+            return
+        shift_id = shift[0]
+        c.execute("SELECT car_number, id FROM cars WHERE shift_id=?", (shift_id,))
+        cars = c.fetchall()
+        if not cars:
+            await query.edit_message_text("Смена пуста.", reply_markup=main_menu(True))
+            return
+        text = "Итоги текущей смены:\n"
+        total_shift = 0
+        for car_number, car_id in cars:
+            c.execute("SELECT service_name, quantity, total_sum FROM services WHERE car_id=?", (car_id,))
+            services = c.fetchall()
+            car_sum = sum(tsum for _, _, tsum in services)
+            total_shift += car_sum
+            text += f"\n{car_number}:\n"
+            for sname, qty, tsum in services:
+                text += f"- {sname} ({qty}): {tsum}₽\n"
+            text += f"Итого по машине: {car_sum}₽\n"
+        text += f"\nСумма по смене: {total_shift}₽"
+        await query.edit_message_text(text, reply_markup=main_menu(True))
+
+    elif query.data == "today_cars":
+        if not shift_opened:
+            await query.edit_message_text("Нет активной смены.", reply_markup=main_menu(False))
+            return
+        shift_id = shift[0]
+        c.execute("SELECT car_number, id FROM cars WHERE shift_id=?", (shift_id,))
+        cars = c.fetchall()
+        if not cars:
+            await query.edit_message_text("Сегодня ещё нет машин.", reply_markup=main_menu(True))
+            return
+        keyboard = [[InlineKeyboardButton(car_number, callback_data=f"edit_car_{car_id}")] for car_number, car_id in cars]
+        await query.edit_message_text("Выберите машину для редактирования:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif query.data.startswith("edit_car_"):
+        car_id = int(query.data.split("_")[2])
+        context.user_data["current_car_id"] = car_id
+        context.user_data["delete_mode"] = False
+        c.execute("SELECT car_number FROM cars WHERE id=?", (car_id,))
+        car_number = c.fetchone()[0]
+        c.execute("SELECT service_name, quantity, total_sum FROM services WHERE car_id=?", (car_id,))
+        services = c.fetchall()
+        text = f"Редактирование машины:\n{car_number}\n\nУслуги:\n"
+        for sname, qty, tsum in services:
+            text += f"- {sname} ({qty}): {tsum}₽\n"
+        await query.edit_message_text(text, reply_markup=services_menu(False))
 
     elif query.data == "reports":
         await query.edit_message_text("Здесь будут отчёты (заглушка).", reply_markup=main_menu(shift_opened))
