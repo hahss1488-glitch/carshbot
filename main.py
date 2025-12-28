@@ -8,7 +8,7 @@ from telegram.ext import (
     MessageHandler, ContextTypes, filters
 )
 
-TOKEN = "ВСТАВЬ_СВОЙ_TOKEN"
+TOKEN = "8385307802:AAE0AJGb8T9RQauVVpLzmFKR1jchrcVZR2c"
 
 MOSCOW = ZoneInfo("Europe/Moscow")
 DEFAULT_REGION = "797"
