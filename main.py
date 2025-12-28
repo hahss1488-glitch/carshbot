@@ -8,10 +8,22 @@ from telegram.ext import (
     MessageHandler, ContextTypes, filters
 )
 
-TOKEN = "8385307802:AAE0AJGb8T9RQauVVpLzmFKR1jchrcVZR2c"
-
+TOKEN = "ВСТАВЬ_СВОЙ_TOKEN"
 MOSCOW = ZoneInfo("Europe/Moscow")
 DEFAULT_REGION = "797"
+
+# ===== ПРАЙС =====
+PRICE_DAY = {
+    "Заправка": 203,
+    "Проверка": 93,
+    "Подкачка": 63
+}
+PRICE_NIGHT = PRICE_DAY.copy()  # Можно настроить другие цены для ночи
+
+def get_price(service_name: str, dt: datetime) -> int:
+    if 21 <= dt.hour or dt.hour < 9:
+        return PRICE_NIGHT.get(service_name, 0)
+    return PRICE_DAY.get(service_name, 0)
 
 # ===== НОРМАЛИЗАЦИЯ НОМЕРА =====
 RU_TO_EN = {
@@ -39,24 +51,10 @@ def normalize_car_number(text: str) -> str | None:
         return None
     return result
 
-# ===== ПРАЙС =====
-PRICE_DAY = {
-    "Заправка": 203,
-    "Проверка": 93,
-    "Подкачка": 63
-}
-PRICE_NIGHT = PRICE_DAY.copy()
-
-def get_price(service_name: str, dt: datetime) -> int:
-    if 21 <= dt.hour or dt.hour < 9:
-        return PRICE_NIGHT.get(service_name, 0)
-    return PRICE_DAY.get(service_name, 0)
-
 # ===== БАЗА =====
 def get_db(user_id):
     conn = sqlite3.connect(f"user_{user_id}.db")
     c = conn.cursor()
-
     c.execute("""CREATE TABLE IF NOT EXISTS shifts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
@@ -94,15 +92,17 @@ def main_menu(shift_opened: bool):
     keyboard.append([InlineKeyboardButton("История смен", callback_data="shift_history")])
     return InlineKeyboardMarkup(keyboard)
 
-def services_menu():
-    keyboard = [
+def services_menu(delete_mode=False):
+    top_buttons = [
+        InlineKeyboardButton("Готова", callback_data="car_done"),
+        InlineKeyboardButton("Удалить услугу" if not delete_mode else "Отмена удаления", callback_data="toggle_delete")
+    ]
+    service_buttons = [
         [InlineKeyboardButton("Заправка", callback_data="service_Заправка")],
         [InlineKeyboardButton("Проверка", callback_data="service_Проверка")],
-        [InlineKeyboardButton("Подкачка", callback_data="service_Подкачка")],
-        [InlineKeyboardButton("Готово", callback_data="car_done")],
-        [InlineKeyboardButton("Назад", callback_data="back_main")]
+        [InlineKeyboardButton("Подкачка", callback_data="service_Подкачка")]
     ]
-    return InlineKeyboardMarkup(keyboard)
+    return InlineKeyboardMarkup([top_buttons] + service_buttons)
 
 # ===== ХЕНДЛЕРЫ =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -118,12 +118,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     conn, c = get_db(user_id)
 
-    # Проверка активной смены
     c.execute("SELECT id FROM shifts WHERE end_time IS NULL ORDER BY id DESC LIMIT 1")
     shift = c.fetchone()
     shift_opened = bool(shift)
 
-    # ==== Главное меню ====
     if query.data == "open_shift":
         now = datetime.now(MOSCOW).isoformat()
         c.execute("INSERT INTO shifts (user_id, start_time) VALUES (?, ?)", (user_id, now))
@@ -153,50 +151,73 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("Нет активной смены.", reply_markup=main_menu(False))
             return
         context.user_data["awaiting_car"] = True
-        await query.edit_message_text("Введите номер машины (например H360PY или H360PY797):", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="back_main")]]))
+        await query.edit_message_text("Введите номер машины (например H360PY или H360PY797):")
 
-    elif query.data.startswith("service_"):
-        if "current_car_id" not in context.user_data:
-            await query.edit_message_text("Сначала выбери машину.", reply_markup=main_menu(shift_opened))
-            return
+    elif query.data.startswith("service_") and "current_car_id" in context.user_data:
         service_name = query.data.split("_")[1]
         car_id = context.user_data["current_car_id"]
         now = datetime.now(MOSCOW).isoformat()
         price = get_price(service_name, datetime.now(MOSCOW))
 
-        c.execute("SELECT id, quantity, total_sum, unit_price FROM services WHERE car_id=? AND service_name=?", (car_id, service_name))
-        s = c.fetchone()
-        if s:
-            sid, qty, total, unit = s
-            qty +=1
-            total += price
-            c.execute("UPDATE services SET quantity=?, total_sum=? WHERE id=?", (qty, total, sid))
-        else:
-            c.execute("INSERT INTO services (car_id, service_name, quantity, unit_price, total_sum, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                      (car_id, service_name, 1, price, price, now))
-        conn.commit()
+        # Режим удаления
+        if context.user_data.get("delete_mode"):
+            c.execute("SELECT id, quantity, total_sum FROM services WHERE car_id=? AND service_name=?", (car_id, service_name))
+            s = c.fetchone()
+            if s:
+                sid, qty, total = s
+                if qty > 1:
+                    qty -= 1
+                    total -= price
+                    c.execute("UPDATE services SET quantity=?, total_sum=? WHERE id=?", (qty, total, sid))
+                else:
+                    c.execute("DELETE FROM services WHERE id=?", (sid,))
+                conn.commit()
+        else:  # обычный режим добавления
+            c.execute("SELECT id, quantity, total_sum FROM services WHERE car_id=? AND service_name=?", (car_id, service_name))
+            s = c.fetchone()
+            if s:
+                sid, qty, total = s
+                qty += 1
+                total += price
+                c.execute("UPDATE services SET quantity=?, total_sum=? WHERE id=?", (qty, total, sid))
+            else:
+                c.execute("INSERT INTO services (car_id, service_name, quantity, unit_price, total_sum, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                          (car_id, service_name, 1, price, price, now))
+            conn.commit()
 
-        # обновляем сообщение красиво
+        # Обновляем сообщение
         c.execute("SELECT car_number FROM cars WHERE id=?", (car_id,))
         car_number = c.fetchone()[0]
         c.execute("SELECT service_name, quantity, total_sum FROM services WHERE car_id=?", (car_id,))
         services = c.fetchall()
-        text = f"Машина записана:\nНомер: {car_number}\n\nВыбранные услуги:\n"
+        text = f"Машина:\n{car_number}\n\nВыбранные услуги:\n"
         total_all = 0
         for sname, qty, tsum in services:
             text += f"- {sname} ({qty}): {tsum}₽\n"
             total_all += tsum
         text += f"\nИтого: {total_all}₽"
-        await query.edit_message_text(text, reply_markup=services_menu())
+        await query.edit_message_text(text, reply_markup=services_menu(context.user_data.get("delete_mode", False)))
+
+    elif query.data == "toggle_delete":
+        context.user_data["delete_mode"] = not context.user_data.get("delete_mode", False)
+        car_id = context.user_data.get("current_car_id")
+        if car_id:
+            c.execute("SELECT car_number FROM cars WHERE id=?", (car_id,))
+            car_number = c.fetchone()[0]
+            c.execute("SELECT service_name, quantity, total_sum FROM services WHERE car_id=?", (car_id,))
+            services = c.fetchall()
+            text = f"Машина:\n{car_number}\n\nВыбранные услуги:\n"
+            total_all = 0
+            for sname, qty, tsum in services:
+                text += f"- {sname} ({qty}): {tsum}₽\n"
+                total_all += tsum
+            text += f"\nИтого: {total_all}₽"
+            await query.edit_message_text(text, reply_markup=services_menu(context.user_data["delete_mode"]))
 
     elif query.data == "car_done":
         context.user_data.pop("current_car_id", None)
+        context.user_data["delete_mode"] = False
         await query.edit_message_text("Машина завершена.", reply_markup=main_menu(True))
-
-    elif query.data == "back_main":
-        context.user_data.pop("awaiting_car", None)
-        context.user_data.pop("current_car_id", None)
-        await query.edit_message_text("Главное меню:", reply_markup=main_menu(shift_opened))
 
     elif query.data == "reports":
         await query.edit_message_text("Здесь будут отчёты (заглушка).", reply_markup=main_menu(shift_opened))
@@ -207,20 +228,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     if not context.user_data.get("awaiting_car"):
-        await update.message.reply_text("Используйте меню.", reply_markup=None)
+        await update.message.reply_text("Используйте меню.")
         return
 
     car_raw = update.message.text
     car = normalize_car_number(car_raw)
     if not car:
-        await update.message.reply_text("Ошибка в номере ТС или регионе.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="back_main")]]))
+        await update.message.reply_text("Ошибка в номере ТС или регионе.")
         return
 
     conn, c = get_db(user_id)
     c.execute("SELECT id FROM shifts WHERE end_time IS NULL ORDER BY id DESC LIMIT 1")
     shift = c.fetchone()
     if not shift:
-        await update.message.reply_text("Нет активной смены.", reply_markup=None)
+        await update.message.reply_text("Нет активной смены.")
         return
     shift_id = shift[0]
 
@@ -237,7 +258,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         f"Машина записана:\nНомер: {car}\n\nВыберите услугу:",
-        reply_markup=services_menu()
+        reply_markup=services_menu(False)
     )
 
 # ===== ЗАПУСК =====
