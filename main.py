@@ -8,8 +8,8 @@ from aiogram.filters import Command, Text
 from aiogram.types import Message, CallbackQuery
 
 # Константы и конфигурация
-API_TOKEN = "ВАШ_ТОКЕН_БОТА"
-OWNER_ID = 123456789  # Телеграм ID владельца (админа) бота
+API_TOKEN = "8385307802:AAE0AJGb8T9RQauVVpLzmFKR1jchrcVZR2c"
+OWNER_ID = 8379101989  # Телеграм ID владельца (админа) бота
 DB_FILENAME = "shifts.db"
 
 # Инициализация бота и диспетчера
