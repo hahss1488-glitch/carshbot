@@ -1,104 +1,126 @@
-# main.py
 import sqlite3
-from datetime import datetime, timedelta
+import re
+from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler,
+    MessageHandler, CallbackQueryHandler,
+    ContextTypes, filters
+)
 
-TOKEN = "8385307802:AAE0AJGb8T9RQauVVpLzmFKR1jchrcVZR2c"  # <- Вставь сюда токен
+TOKEN = "ВСТАВЬ_СВОЙ_TOKEN"
 
-PRICE = {
-    "запр": 203,
-    "пров": 93
+# ===== НОРМАЛИЗАЦИЯ НОМЕРА =====
+
+RU_TO_EN = {
+    "А": "A", "В": "B", "Е": "E", "К": "K",
+    "М": "M", "Н": "H", "О": "O", "Р": "P",
+    "С": "C", "Т": "T", "У": "Y", "Х": "X"
 }
 
+ALLOWED_LETTERS = set("ABEKMHOPCTYX")
+
+def normalize_car_number(text: str) -> str | None:
+    text = text.upper().replace(" ", "")
+    result = ""
+    for ch in text:
+        result += RU_TO_EN.get(ch, ch)
+    # формат: A123BC777
+    pattern = r"^[A-Z][0-9]{3}[A-Z]{2}[0-9]{3}$"
+    if not re.match(pattern, result):
+        return None
+    letters = result[0] + result[4:6]
+    if any(l not in ALLOWED_LETTERS for l in letters):
+        return None
+    return result
+
+# ===== БАЗА =====
+
 def get_db(user_id):
-    db_name = f"data_{user_id}.db"
-    conn = sqlite3.connect(db_name)
+    conn = sqlite3.connect(f"user_{user_id}.db")
     c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS records (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            machine TEXT,
-            service TEXT,
-            amount INTEGER,
-            date TEXT
-        )
-    """)
+
+    c.execute("""CREATE TABLE IF NOT EXISTS shifts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        start_time TEXT,
+        end_time TEXT
+    )""")
+
+    c.execute("""CREATE TABLE IF NOT EXISTS cars (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        shift_id INTEGER,
+        car_number TEXT,
+        created_at TEXT,
+        UNIQUE(shift_id, car_number)
+    )""")
+
     conn.commit()
     return conn, c
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("Записать машину", callback_data="record")],
-        [InlineKeyboardButton("Отчеты", callback_data="reports")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("Привет! Выбирай действие:", reply_markup=reply_markup)
+# ===== ХЕНДЛЕРЫ =====
 
-async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [[InlineKeyboardButton("Начать смену", callback_data="start_shift")]]
+    await update.message.reply_text(
+        "Готов к работе.",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+
     user_id = query.from_user.id
     conn, c = get_db(user_id)
 
-    if query.data == "record":
-        keyboard = [
-            [InlineKeyboardButton("запр", callback_data="service_запр")],
-            [InlineKeyboardButton("пров", callback_data="service_пров")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text("Выберите услугу:", reply_markup=reply_markup)
+    if query.data == "start_shift":
+        c.execute(
+            "INSERT INTO shifts (user_id, start_time) VALUES (?, ?)",
+            (user_id, datetime.now().isoformat())
+        )
+        conn.commit()
 
-    elif query.data.startswith("service_"):
-        service = query.data.split("_")[1]
-        context.user_data["service"] = service
-        await query.edit_message_text("Введите номер машины:")
-
-    elif query.data == "reports":
-        now = datetime.now()
-        today_str = now.strftime("%Y-%m-%d")
-        c.execute("SELECT COUNT(*), SUM(amount) FROM records WHERE date LIKE ?", (today_str+'%',))
-        count, total = c.fetchone()
-        total = total or 0
-
-        date_from = (now - timedelta(days=9)).strftime("%Y-%m-%d")
-        c.execute("SELECT SUM(amount) FROM records WHERE date BETWEEN ? AND ?", (date_from, today_str))
-        dec_total = c.fetchone()[0] or 0
-
-        c.execute("SELECT COUNT(DISTINCT machine) FROM records")
-        total_machines = c.fetchone()[0] or 0
-
-        c.execute("SELECT SUM(amount) FROM records")
-        total_sum = c.fetchone()[0] or 0
-        avg = total_sum / total_machines if total_machines else 0
-
-        msg = f"Итоги:\nСегодня: {count} машин, сумма {total}₽\n" \
-              f"Декада: сумма {dec_total}₽\n" \
-              f"Всего машин: {total_machines}\nСредний чек: {avg:.0f}₽"
-        await query.edit_message_text(msg)
+        await query.edit_message_text(
+            "Смена начата.\nВведи номер машины (формат A123BC777)."
+        )
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
-    service = context.user_data.get("service")
-    if not service:
-        await update.message.reply_text("Сначала выбери услугу через кнопки.")
+    car_raw = update.message.text
+    car = normalize_car_number(car_raw)
+
+    if not car:
+        await update.message.reply_text("Ошибка в номере ТС или регионе.")
         return
 
-    machine = update.message.text.strip()
-    amount = PRICE.get(service, 0)
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
     conn, c = get_db(user_id)
-    c.execute("INSERT INTO records (machine, service, amount, date) VALUES (?, ?, ?, ?)",
-              (machine, service, amount, now_str))
-    conn.commit()
 
-    await update.message.reply_text(f"Записано: Машина {machine}, услуга {service}, сумма {amount}₽")
-    context.user_data.pop("service")
+    # Находим активную смену
+    c.execute("SELECT id FROM shifts WHERE end_time IS NULL ORDER BY id DESC LIMIT 1")
+    shift = c.fetchone()
+    if not shift:
+        await update.message.reply_text("Нет активной смены. Сначала начни смену.")
+        return
+
+    shift_id = shift[0]
+
+    try:
+        c.execute(
+            "INSERT INTO cars (shift_id, car_number, created_at) VALUES (?, ?, ?)",
+            (shift_id, car, datetime.now().isoformat())
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        pass  # машина уже есть в смене
+
+    await update.message.reply_text(f"Машина {car} выбрана.")
+    
+# ===== ЗАПУСК =====
 
 app = ApplicationBuilder().token(TOKEN).build()
 app.add_handler(CommandHandler("start", start))
-app.add_handler(CallbackQueryHandler(button))
+app.add_handler(CallbackQueryHandler(buttons))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
 if __name__ == "__main__":
