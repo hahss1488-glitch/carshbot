@@ -5,8 +5,8 @@ from telegram import ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMa
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackQueryHandler, ConversationHandler, CallbackContext
 
 # Токен бота и ID администратора (указать реальный токен и ваш Telegram ID)
-TOKEN = 'YOUR_TELEGRAM_BOT_TOKEN'
-ADMIN_ID = 123456789  # замените на ваш Telegram ID
+TOKEN = '8385307802:AAE0AJGb8T9RQauVVpLzmFKR1jchrcVZR2c'
+ADMIN_ID = 8379101989  # замените на ваш Telegram ID
 
 # Настройка логирования
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
