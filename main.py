@@ -17,7 +17,7 @@ from telegram.ext import (
     filters,
 )
 
-TOKEN = "PASTE_YOUR_TOKEN_HERE"
+TOKEN = "8385307802:AAE0AJGb8T9RQauVVpLzmFKR1jchrcVZR2c"
 TZ = ZoneInfo("Europe/Moscow")
 
 # ===== ПРАЙС (ПОКА ЗАГЛУШКА, ТЫ ЗАМЕНИШЬ) =====
