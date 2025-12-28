@@ -1,336 +1,396 @@
+# Импорт необходимых модулей
+import logging
 import sqlite3
-import re
-from datetime import datetime
-from zoneinfo import ZoneInfo
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    ApplicationBuilder, CommandHandler, CallbackQueryHandler,
-    MessageHandler, ContextTypes, filters
-)
+from telegram import ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackQueryHandler, ConversationHandler, CallbackContext
 
-TOKEN = "8385307802:AAE0AJGb8T9RQauVVpLzmFKR1jchrcVZR2c"
-MOSCOW = ZoneInfo("Europe/Moscow")
-DEFAULT_REGION = "797"
+# Токен бота и ID администратора (указать реальный токен и ваш Telegram ID)
+TOKEN = 'YOUR_TELEGRAM_BOT_TOKEN'
+ADMIN_ID = 123456789  # замените на ваш Telegram ID
 
-# ===== ПРАЙС =====
-PRICE_DAY = {
-    "Заправка": 203,
-    "Проверка": 93,
-    "Подкачка": 63
-}
-PRICE_NIGHT = PRICE_DAY.copy()  # Можно задать разные цены для ночи
+# Настройка логирования
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-def get_price(service_name: str, dt: datetime) -> int:
-    if 21 <= dt.hour or dt.hour < 9:
-        return PRICE_NIGHT.get(service_name, 0)
-    return PRICE_DAY.get(service_name, 0)
+# Подключение к базе данных (создаётся файл bot.db)
+conn = sqlite3.connect('bot.db', check_same_thread=False)
+cursor = conn.cursor()
 
-# ===== НОРМАЛИЗАЦИЯ НОМЕРА =====
-RU_TO_EN = {
-    "А": "A", "В": "B", "Е": "E", "К": "K",
-    "М": "M", "Н": "H", "О": "O", "Р": "P",
-    "С": "C", "Т": "T", "У": "Y", "Х": "X"
-}
-ALLOWED_LETTERS = set("ABEKMHOPCTYX")
+# Создание таблиц, если их ещё нет
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY,
+    username TEXT
+);
+""")
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS categories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL
+);
+""")
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS products (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    description TEXT,
+    price REAL,
+    category_id INTEGER
+);
+""")
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS cart (
+    user_id INTEGER,
+    product_id INTEGER,
+    quantity INTEGER,
+    PRIMARY KEY (user_id, product_id)
+);
+""")
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    items TEXT,
+    total REAL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+""")
+conn.commit()
 
-def normalize_car_number(text: str) -> str | None:
-    text = text.upper().replace(" ", "")
-    result = ""
-    for ch in text:
-        result += RU_TO_EN.get(ch, ch)
-    pattern_full = r"^[A-Z][0-9]{3}[A-Z]{2}[0-9]{3}$"
-    pattern_no_region = r"^[A-Z][0-9]{3}[A-Z]{2}$"
-    if re.match(pattern_full, result):
-        pass
-    elif re.match(pattern_no_region, result):
-        result += DEFAULT_REGION
-    else:
-        return None
-    letters = result[0] + result[4:6]
-    if any(l not in ALLOWED_LETTERS for l in letters):
-        return None
-    return result
-
-# ===== БАЗА =====
-def get_db(user_id):
-    conn = sqlite3.connect(f"user_{user_id}.db")
-    c = conn.cursor()
-    c.execute("""CREATE TABLE IF NOT EXISTS shifts (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        start_time TEXT,
-        end_time TEXT
-    )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS cars (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        shift_id INTEGER,
-        car_number TEXT,
-        created_at TEXT,
-        UNIQUE(shift_id, car_number)
-    )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS services (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        car_id INTEGER,
-        service_name TEXT,
-        quantity INTEGER,
-        unit_price INTEGER,
-        total_sum INTEGER,
-        created_at TEXT
-    )""")
+# Наполнение тестовых данных (если таблицы пусты)
+cursor.execute("SELECT COUNT(*) FROM categories;")
+if cursor.fetchone()[0] == 0:
+    # Пример категорий
+    cursor.execute("INSERT INTO categories (name) VALUES (?)", ("Электроника",))
+    cursor.execute("INSERT INTO categories (name) VALUES (?)", ("Книги",))
     conn.commit()
-    return conn, c
+cursor.execute("SELECT COUNT(*) FROM products;")
+if cursor.fetchone()[0] == 0:
+    # Пример товаров: имя, описание, цена, id категории
+    products = [
+        ("Смартфон", "Современный смартфон с хорошей камерой.", 0.0, 1),
+        ("Ноутбук", "Удобный ноутбук для работы и игр.", 0.0, 1),
+        ("Роман «Приключения»", "Увлекательный приключенческий роман.", 0.0, 2)
+    ]
+    cursor.executemany("INSERT INTO products (name, description, price, category_id) VALUES (?, ?, ?, ?);", products)
+    conn.commit()
 
-# ===== МЕНЮ =====
-def main_menu(shift_opened: bool):
-    keyboard = []
-    if not shift_opened:
-        keyboard.append([InlineKeyboardButton("Открыть смену", callback_data="open_shift")])
+# Клавиатуры
+def get_main_menu(is_admin=False):
+    """Возвращает клавиатуру главного меню в зависимости от роли пользователя."""
+    if is_admin:
+        buttons = [
+            ["Добавить товар", "Просмотр заказов"],
+            ["Рассылка", "Пользователи"]
+        ]
     else:
-        keyboard.append([InlineKeyboardButton("Закрыть смену", callback_data="close_shift")])
-    keyboard.append([InlineKeyboardButton("Записать машину", callback_data="record_car")])
-    if shift_opened:
-        keyboard.append([InlineKeyboardButton("Итоги текущей смены", callback_data="shift_summary")])
-        keyboard.append([InlineKeyboardButton("Список машин за сегодня", callback_data="today_cars")])
-    keyboard.append([InlineKeyboardButton("Отчёты", callback_data="reports")])
-    keyboard.append([InlineKeyboardButton("История смен", callback_data="shift_history")])
-    return InlineKeyboardMarkup(keyboard)
+        buttons = [
+            ["Каталог", "Корзина"],
+            ["О нас"]
+        ]
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
-def services_menu(delete_mode=False):
-    top_buttons = [
-        InlineKeyboardButton("Готова", callback_data="car_done"),
-        InlineKeyboardButton("Удалить услугу" if not delete_mode else "Отмена удаления", callback_data="toggle_delete")
-    ]
-    service_buttons = [
-        [InlineKeyboardButton("Заправка", callback_data="service_Заправка")],
-        [InlineKeyboardButton("Проверка", callback_data="service_Проверка")],
-        [InlineKeyboardButton("Подкачка", callback_data="service_Подкачка")]
-    ]
-    return InlineKeyboardMarkup([top_buttons] + service_buttons)
+# Состояния для ConversationHandler (добавление товара, рассылка)
+ADD_NAME, ADD_DESC, ADD_PRICE = range(3)
+BROADCAST = range(1)
 
-# ===== ХЕНДЛЕРЫ =====
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    conn, c = get_db(user_id)
-    c.execute("SELECT id FROM shifts WHERE end_time IS NULL ORDER BY id DESC LIMIT 1")
-    shift_opened = bool(c.fetchone())
-    await update.message.reply_text("Главное меню:", reply_markup=main_menu(shift_opened))
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    conn, c = get_db(user_id)
-
-    c.execute("SELECT id FROM shifts WHERE end_time IS NULL ORDER BY id DESC LIMIT 1")
-    shift = c.fetchone()
-    shift_opened = bool(shift)
-
-    if query.data == "open_shift":
-        now = datetime.now(MOSCOW).isoformat()
-        c.execute("INSERT INTO shifts (user_id, start_time) VALUES (?, ?)", (user_id, now))
-        conn.commit()
-        await query.edit_message_text(f"Смена открыта: {datetime.now(MOSCOW).strftime('%d.%m.%Y %H:%M')}", reply_markup=main_menu(True))
-
-    elif query.data == "close_shift":
-        if not shift_opened:
-            await query.edit_message_text("Нет активной смены.", reply_markup=main_menu(False))
-            return
-        shift_id = shift[0]
-        c.execute("SELECT start_time FROM shifts WHERE id=?", (shift_id,))
-        start_time = datetime.fromisoformat(c.fetchone()[0])
-        end_time = datetime.now(MOSCOW)
-        duration = end_time - start_time
-        c.execute("UPDATE shifts SET end_time=? WHERE id=?", (end_time.isoformat(), shift_id))
-        conn.commit()
-        await query.edit_message_text(
-            f"Смена закрыта:\nНачало: {start_time.strftime('%d.%m.%Y %H:%M')}\n"
-            f"Конец: {end_time.strftime('%d.%m.%Y %H:%M')}\n"
-            f"Длительность: {duration.seconds//3600} ч {(duration.seconds//60)%60} мин",
-            reply_markup=main_menu(False)
+# Функции-обработчики
+def start(update: Update, context: CallbackContext) -> None:
+    """Обработка команды /start."""
+    user = update.effective_user
+    user_id = user.id
+    is_admin = (user_id == ADMIN_ID)
+    # Добавляем пользователя в БД при первом входе
+    cursor.execute("INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?);", (user_id, user.username))
+    conn.commit()
+    # Приветствие
+    if is_admin:
+        update.message.reply_text(
+            "Добро пожаловать, администратор! Вы можете управлять ботом через меню ниже.",
+            reply_markup=get_main_menu(is_admin=True)
+        )
+    else:
+        update.message.reply_text(
+            "Привет! Это тестовый магазин-бот. Выберите пункт меню.",
+            reply_markup=get_main_menu()
         )
 
-    elif query.data == "record_car":
-        if not shift_opened:
-            await query.edit_message_text("Нет активной смены.", reply_markup=main_menu(False))
-            return
-        context.user_data["awaiting_car"] = True
-        await query.edit_message_text("Введите номер машины (например H360PY или H360PY797):")
+def help_command(update: Update, context: CallbackContext) -> None:
+    """Обработка команды /help."""
+    help_text = (
+        "Я бот магазина. С помощью этого бота можно просматривать товары, добавлять их в корзину и оформлять заказ.\n\n"
+        "Доступные команды и кнопки:\n"
+        "/start – главное меню\n"
+        "Каталог – просмотреть список товаров\n"
+        "Корзина – просмотреть корзину и оформить заказ\n"
+        "О нас – информация о боте\n"
+        "/cancel – отмена текущей операции (для администратора)\n"
+    )
+    update.message.reply_text(help_text)
 
-    elif query.data.startswith("service_") and "current_car_id" in context.user_data:
-        service_name = query.data.split("_")[1]
-        car_id = context.user_data["current_car_id"]
-        now = datetime.now(MOSCOW).isoformat()
-        price = get_price(service_name, datetime.now(MOSCOW))
-
-        # Режим удаления
-        if context.user_data.get("delete_mode"):
-            c.execute("SELECT id, quantity, total_sum FROM services WHERE car_id=? AND service_name=?", (car_id, service_name))
-            s = c.fetchone()
-            if s:
-                sid, qty, total = s
-                if qty > 1:
-                    qty -= 1
-                    total -= price
-                    c.execute("UPDATE services SET quantity=?, total_sum=? WHERE id=?", (qty, total, sid))
-                else:
-                    c.execute("DELETE FROM services WHERE id=?", (sid,))
-                conn.commit()
-        else:  # обычный режим добавления
-            c.execute("SELECT id, quantity, total_sum FROM services WHERE car_id=? AND service_name=?", (car_id, service_name))
-            s = c.fetchone()
-            if s:
-                sid, qty, total = s
-                qty += 1
-                total += price
-                c.execute("UPDATE services SET quantity=?, total_sum=? WHERE id=?", (qty, total, sid))
-            else:
-                c.execute("INSERT INTO services (car_id, service_name, quantity, unit_price, total_sum, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                          (car_id, service_name, 1, price, price, now))
-            conn.commit()
-
-        # Обновляем сообщение карточки машины
-        c.execute("SELECT car_number FROM cars WHERE id=?", (car_id,))
-        car_number = c.fetchone()[0]
-        c.execute("SELECT service_name, quantity, total_sum FROM services WHERE car_id=?", (car_id,))
-        services = c.fetchall()
-        text = f"Машина:\n{car_number}\n\nВыбранные услуги:\n"
-        total_all = 0
-        for sname, qty, tsum in services:
-            text += f"- {sname} ({qty}): {tsum}₽\n"
-            total_all += tsum
-        text += f"\nИтого: {total_all}₽"
-        await query.edit_message_text(text, reply_markup=services_menu(context.user_data.get("delete_mode", False)))
-
-    elif query.data == "toggle_delete":
-        context.user_data["delete_mode"] = not context.user_data.get("delete_mode", False)
-        car_id = context.user_data.get("current_car_id")
-        if car_id:
-            c.execute("SELECT car_number FROM cars WHERE id=?", (car_id,))
-            car_number = c.fetchone()[0]
-            c.execute("SELECT service_name, quantity, total_sum FROM services WHERE car_id=?", (car_id,))
-            services = c.fetchall()
-            text = f"Машина:\n{car_number}\n\nВыбранные услуги:\n"
-            total_all = 0
-            for sname, qty, tsum in services:
-                text += f"- {sname} ({qty}): {tsum}₽\n"
-                total_all += tsum
-            text += f"\nИтого: {total_all}₽"
-            await query.edit_message_text(text, reply_markup=services_menu(context.user_data["delete_mode"]))
-
-    elif query.data == "car_done":
-        car_id = context.user_data.pop("current_car_id", None)
-        context.user_data["delete_mode"] = False
-        if car_id:
-            c.execute("SELECT car_number FROM cars WHERE id=?", (car_id,))
-            car_number = c.fetchone()[0]
-            c.execute("SELECT service_name, quantity, total_sum FROM services WHERE car_id=?", (car_id,))
-            services = c.fetchall()
-            text = f"Машина записана:\n{car_number}\n\nУслуги:\n"
-            total_all = 0
-            for sname, qty, tsum in services:
-                text += f"- {sname} ({qty}): {tsum}₽\n"
-                total_all += tsum
-            text += f"\nИтого: {total_all}₽"
-            await query.message.reply_text(text)
-        await query.edit_message_text("Выберите действие:", reply_markup=main_menu(True))
-
-    elif query.data == "shift_summary":
-        if not shift_opened:
-            await query.edit_message_text("Нет активной смены.", reply_markup=main_menu(False))
-            return
-        shift_id = shift[0]
-        c.execute("SELECT car_number, id FROM cars WHERE shift_id=?", (shift_id,))
-        cars = c.fetchall()
-        if not cars:
-            await query.edit_message_text("Смена пуста.", reply_markup=main_menu(True))
-            return
-        text = "Итоги текущей смены:\n"
-        total_shift = 0
-        for car_number, car_id in cars:
-            c.execute("SELECT service_name, quantity, total_sum FROM services WHERE car_id=?", (car_id,))
-            services = c.fetchall()
-            car_sum = sum(tsum for _, _, tsum in services)
-            total_shift += car_sum
-            text += f"\n{car_number}:\n"
-            for sname, qty, tsum in services:
-                text += f"- {sname} ({qty}): {tsum}₽\n"
-            text += f"Итого по машине: {car_sum}₽\n"
-        text += f"\nСумма по смене: {total_shift}₽"
-        await query.edit_message_text(text, reply_markup=main_menu(True))
-
-    elif query.data == "today_cars":
-        if not shift_opened:
-            await query.edit_message_text("Нет активной смены.", reply_markup=main_menu(False))
-            return
-        shift_id = shift[0]
-        c.execute("SELECT car_number, id FROM cars WHERE shift_id=?", (shift_id,))
-        cars = c.fetchall()
-        if not cars:
-            await query.edit_message_text("Сегодня ещё нет машин.", reply_markup=main_menu(True))
-            return
-        keyboard = [[InlineKeyboardButton(car_number, callback_data=f"edit_car_{car_id}")] for car_number, car_id in cars]
-        await query.edit_message_text("Выберите машину для редактирования:", reply_markup=InlineKeyboardMarkup(keyboard))
-
-    elif query.data.startswith("edit_car_"):
-        car_id = int(query.data.split("_")[2])
-        context.user_data["current_car_id"] = car_id
-        context.user_data["delete_mode"] = False
-        c.execute("SELECT car_number FROM cars WHERE id=?", (car_id,))
-        car_number = c.fetchone()[0]
-        c.execute("SELECT service_name, quantity, total_sum FROM services WHERE car_id=?", (car_id,))
-        services = c.fetchall()
-        text = f"Редактирование машины:\n{car_number}\n\nУслуги:\n"
-        for sname, qty, tsum in services:
-            text += f"- {sname} ({qty}): {tsum}₽\n"
-        await query.edit_message_text(text, reply_markup=services_menu(False))
-
-    elif query.data == "reports":
-        await query.edit_message_text("Здесь будут отчёты (заглушка).", reply_markup=main_menu(shift_opened))
-
-    elif query.data == "shift_history":
-        await query.edit_message_text("Здесь будет история смен (заглушка).", reply_markup=main_menu(shift_opened))
-
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    if not context.user_data.get("awaiting_car"):
-        await update.message.reply_text("Используйте меню.")
-        return
-
-    car_raw = update.message.text
-    car = normalize_car_number(car_raw)
-    if not car:
-        await update.message.reply_text("Ошибка в номере ТС или регионе.")
-        return
-
-    conn, c = get_db(user_id)
-    c.execute("SELECT id FROM shifts WHERE end_time IS NULL ORDER BY id DESC LIMIT 1")
-    shift = c.fetchone()
-    if not shift:
-        await update.message.reply_text("Нет активной смены.")
-        return
-    shift_id = shift[0]
-
-    try:
-        c.execute("INSERT INTO cars (shift_id, car_number, created_at) VALUES (?, ?, ?)", (shift_id, car, datetime.now(MOSCOW).isoformat()))
-        conn.commit()
-    except sqlite3.IntegrityError:
-        pass
-
-    c.execute("SELECT id FROM cars WHERE shift_id=? AND car_number=?", (shift_id, car))
-    car_id = c.fetchone()[0]
-    context.user_data["current_car_id"] = car_id
-    context.user_data.pop("awaiting_car", None)
-
-    await update.message.reply_text(
-        f"Машина записана:\nНомер: {car}\n\nВыберите услугу:",
-        reply_markup=services_menu(False)
+def about(update: Update, context: CallbackContext) -> None:
+    """Вывод информации о боте."""
+    update.message.reply_text(
+        "Этот бот демонстрирует базовый функционал интернет-магазина в Telegram.\n"
+        "Вы можете просмотреть каталог товаров и оформить заказ. Контакт администратора можно получить из кода бота."
     )
 
-# ===== ЗАПУСК =====
-app = ApplicationBuilder().token(TOKEN).build()
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CallbackQueryHandler(button_handler))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+def show_catalog(update: Update, context: CallbackContext) -> None:
+    """Показать список категорий товаров (Inline-кнопки)."""
+    categories = cursor.execute("SELECT id, name FROM categories;").fetchall()
+    if not categories:
+        update.message.reply_text("Каталог пуст.")
+        return
+    buttons = [[InlineKeyboardButton(name, callback_data=f"cat_{cat_id}")] for cat_id, name in categories]
+    markup = InlineKeyboardMarkup(buttons)
+    update.message.reply_text("Выберите категорию товара:", reply_markup=markup)
 
-if __name__ == "__main__":
-    app.run_polling()
+def category_selected(update: Update, context: CallbackContext) -> None:
+    """Обработка выбора категории товаров."""
+    query = update.callback_query
+    cat_id = int(query.data.split("_")[1])
+    query.answer()
+    query.edit_message_reply_markup(reply_markup=None)
+    products = cursor.execute(
+        "SELECT id, name, description, price FROM products WHERE category_id = ?;", (cat_id,)
+    ).fetchall()
+    if not products:
+        context.bot.send_message(chat_id=query.message.chat_id, text="В этой категории нет товаров.")
+        return
+    for prod_id, name, desc, price in products:
+        text = f"*{name}*\n{desc}\nЦена: {price} руб."
+        button = InlineKeyboardMarkup([[InlineKeyboardButton("Добавить в корзину", callback_data=f"add_{prod_id}")]])
+        context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=text,
+            reply_markup=button,
+            parse_mode='Markdown'
+        )
+
+def add_to_cart(update: Update, context: CallbackContext) -> None:
+    """Добавить товар в корзину."""
+    query = update.callback_query
+    user_id = query.from_user.id
+    prod_id = int(query.data.split("_")[1])
+    current = cursor.execute(
+        "SELECT quantity FROM cart WHERE user_id = ? AND product_id = ?;", (user_id, prod_id)
+    ).fetchone()
+    if current:
+        cursor.execute(
+            "UPDATE cart SET quantity = quantity + 1 WHERE user_id = ? AND product_id = ?;",
+            (user_id, prod_id)
+        )
+    else:
+        cursor.execute(
+            "INSERT INTO cart (user_id, product_id, quantity) VALUES (?, ?, 1);",
+            (user_id, prod_id)
+        )
+    conn.commit()
+    query.answer("Товар добавлен в корзину.")
+
+def view_cart(update: Update, context: CallbackContext) -> None:
+    """Показать содержимое корзины."""
+    user_id = update.effective_user.id
+    items = cursor.execute(
+        "SELECT p.id, p.name, c.quantity FROM cart c JOIN products p ON c.product_id = p.id WHERE c.user_id = ?;",
+        (user_id,)
+    ).fetchall()
+    if not items:
+        update.message.reply_text("Корзина пуста.")
+        return
+    total = 0.0
+    for prod_id, name, qty in items:
+        text = f"{name} (в количестве {qty})"
+        button = InlineKeyboardMarkup([[InlineKeyboardButton("Удалить", callback_data=f"remove_{prod_id}")]])
+        update.message.reply_text(text, reply_markup=button)
+        price = cursor.execute("SELECT price FROM products WHERE id = ?;", (prod_id,)).fetchone()[0]
+        total += (price * qty) if price else 0
+    order_button = InlineKeyboardMarkup([[InlineKeyboardButton("Оформить заказ", callback_data="order")]])
+    update.message.reply_text(f"Итого: {total} руб.", reply_markup=order_button)
+
+def remove_from_cart(update: Update, context: CallbackContext) -> None:
+    """Удалить товар из корзины."""
+    query = update.callback_query
+    user_id = query.from_user.id
+    prod_id = int(query.data.split("_")[1])
+    cursor.execute("DELETE FROM cart WHERE user_id = ? AND product_id = ?;", (user_id, prod_id))
+    conn.commit()
+    query.answer("Товар удалён из корзины.")
+
+def place_order(update: Update, context: CallbackContext) -> None:
+    """Оформить заказ."""
+    query = update.callback_query
+    user_id = query.from_user.id
+    items = cursor.execute(
+        "SELECT p.name, c.quantity, p.price FROM cart c JOIN products p ON c.product_id = p.id WHERE c.user_id = ?;",
+        (user_id,)
+    ).fetchall()
+    if not items:
+        query.answer("Корзина пуста.")
+        return
+    order_items = []
+    total = 0.0
+    for name, qty, price in items:
+        order_items.append(f"{name} x{qty}")
+        total += (price * qty) if price else 0
+    order_text = "; ".join(order_items)
+    cursor.execute("INSERT INTO orders (user_id, items, total) VALUES (?, ?, ?);", (user_id, order_text, total))
+    cursor.execute("DELETE FROM cart WHERE user_id = ?;", (user_id,))
+    conn.commit()
+    query.answer("Заказ оформлен.")
+    message = (
+        f"Новый заказ (ID: {cursor.lastrowid}) от пользователя {user_id}:\n"
+        f"{order_text}\nСумма: {total} руб."
+    )
+    context.bot.send_message(chat_id=ADMIN_ID, text=message)
+
+def add_product_start(update: Update, context: CallbackContext) -> int:
+    """Начало добавления нового товара (для администратора)."""
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID:
+        update.message.reply_text("У вас нет прав для добавления товара.")
+        return ConversationHandler.END
+    update.message.reply_text("Введите название нового товара или /cancel для отмены:")
+    return ADD_NAME
+
+def add_name(update: Update, context: CallbackContext) -> int:
+    """Получаем название товара."""
+    context.user_data['new_name'] = update.message.text
+    update.message.reply_text("Введите описание товара:")
+    return ADD_DESC
+
+def add_desc(update: Update, context: CallbackContext) -> int:
+    """Получаем описание товара."""
+    context.user_data['new_desc'] = update.message.text
+    update.message.reply_text("Введите цену товара (числом):")
+    return ADD_PRICE
+
+def add_price(update: Update, context: CallbackContext) -> int:
+    """Получаем цену и сохраняем товар."""
+    text = update.message.text
+    try:
+        price = float(text)
+    except ValueError:
+        update.message.reply_text("Пожалуйста, введите корректную цену (число):")
+        return ADD_PRICE
+    name = context.user_data.get('new_name')
+    desc = context.user_data.get('new_desc')
+    cursor.execute(
+        "INSERT INTO products (name, description, price, category_id) VALUES (?, ?, ?, ?);",
+        (name, desc, price, 1)
+    )
+    conn.commit()
+    update.message.reply_text("Товар успешно добавлен.")
+    return ConversationHandler.END
+
+def list_orders(update: Update, context: CallbackContext) -> None:
+    """Показать список всех заказов (для администратора)."""
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID:
+        update.message.reply_text("У вас нет доступа к заказам.")
+        return
+    orders = cursor.execute("SELECT id, user_id, items, total FROM orders;").fetchall()
+    if not orders:
+        update.message.reply_text("Нет заказов.")
+        return
+    for oid, uid, items, total in orders:
+        text = f"Заказ ID {oid} от {uid}:\n{items}\nСумма: {total} руб."
+        update.message.reply_text(text)
+
+def broadcast_start(update: Update, context: CallbackContext) -> int:
+    """Начало рассылки от администратора."""
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID:
+        update.message.reply_text("У вас нет прав для рассылки.")
+        return ConversationHandler.END
+    update.message.reply_text("Введите текст сообщения для рассылки или /cancel:")
+    return BROADCAST
+
+def broadcast_send(update: Update, context: CallbackContext) -> int:
+    """Отправка рассылки всем пользователям."""
+    text = update.message.text
+    users = cursor.execute("SELECT user_id FROM users;").fetchall()
+    for (uid,) in users:
+        try:
+            context.bot.send_message(chat_id=uid, text=text)
+        except Exception as e:
+            logger.warning(f"Не удалось отправить сообщение пользователю {uid}: {e}")
+    update.message.reply_text("Сообщение отправлено всем пользователям.")
+    return ConversationHandler.END
+
+def list_users(update: Update, context: CallbackContext) -> None:
+    """Показать количество зарегистрированных пользователей (для администратора)."""
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID:
+        update.message.reply_text("У вас нет доступа к списку пользователей.")
+        return
+    count = cursor.execute("SELECT COUNT(*) FROM users;").fetchone()[0]
+    update.message.reply_text(f"Всего пользователей: {count}")
+
+def cancel(update: Update, context: CallbackContext) -> int:
+    """Отменить текущее действие (ConversationHandler)."""
+    update.message.reply_text("Действие отменено.", reply_markup=get_main_menu(is_admin=True))
+    return ConversationHandler.END
+
+def unknown(update: Update, context: CallbackContext) -> None:
+    """Обработка неизвестных сообщений."""
+    update.message.reply_text("Команда не распознана. Используйте /help.")
+
+# Подключение хендлеров к диспетчеру
+updater = Updater(TOKEN)
+dp = updater.dispatcher
+
+# Команды
+dp.add_handler(CommandHandler('start', start))
+dp.add_handler(CommandHandler('help', help_command))
+dp.add_handler(CommandHandler('cancel', cancel))
+
+# Текстовые кнопки меню (ReplyKeyboard)
+dp.add_handler(MessageHandler(Filters.regex('^(Каталог)$'), show_catalog))
+dp.add_handler(MessageHandler(Filters.regex('^(Корзина)$'), view_cart))
+dp.add_handler(MessageHandler(Filters.regex('^(О нас)$'), about))
+dp.add_handler(MessageHandler(Filters.regex('^(Добавить товар)$'), add_product_start))
+dp.add_handler(MessageHandler(Filters.regex('^(Просмотр заказов)$'), list_orders))
+dp.add_handler(MessageHandler(Filters.regex('^(Рассылка)$'), broadcast_start))
+dp.add_handler(MessageHandler(Filters.regex('^(Пользователи)$'), list_users))
+
+# ConversationHandlers для администратора
+dp.add_handler(ConversationHandler(
+    entry_points=[
+        CommandHandler('add_product', add_product_start),
+        MessageHandler(Filters.regex('^(Добавить товар)$'), add_product_start)
+    ],
+    states={
+        ADD_NAME: [MessageHandler(Filters.text & ~Filters.command, add_name)],
+        ADD_DESC: [MessageHandler(Filters.text & ~Filters.command, add_desc)],
+        ADD_PRICE: [MessageHandler(Filters.text & ~Filters.command, add_price)]
+    },
+    fallbacks=[CommandHandler('cancel', cancel)]
+))
+dp.add_handler(ConversationHandler(
+    entry_points=[
+        CommandHandler('broadcast', broadcast_start),
+        MessageHandler(Filters.regex('^(Рассылка)$'), broadcast_start)
+    ],
+    states={
+        BROADCAST: [MessageHandler(Filters.text & ~Filters.command, broadcast_send)]
+    },
+    fallbacks=[CommandHandler('cancel', cancel)]
+))
+
+# CallbackQueryHandlers для inline-кнопок
+dp.add_handler(CallbackQueryHandler(category_selected, pattern='^cat_'))
+dp.add_handler(CallbackQueryHandler(add_to_cart, pattern='^add_'))
+dp.add_handler(CallbackQueryHandler(remove_from_cart, pattern='^remove_'))
+dp.add_handler(CallbackQueryHandler(place_order, pattern='^order$'))
+
+# Неизвестные команды и текст
+dp.add_handler(MessageHandler(Filters.command, unknown))
+dp.add_handler(MessageHandler(Filters.text, unknown))
+
+# Запуск бота
+if __name__ == '__main__':
+    print("Бот запущен...")
+    updater.start_polling()
+    updater.idle()
+
