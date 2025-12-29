@@ -1,19 +1,13 @@
 import asyncio
 import sqlite3
-import re
-from datetime import datetime, time
-
-from aiogram import Bot, Dispatcher
-from aiogram.types import (
-    ReplyKeyboardMarkup, KeyboardButton,
-    InlineKeyboardButton, InlineKeyboardMarkup,
-    Message, CallbackQuery
-)
-from aiogram.filters import Command, Text
+from aiogram import Bot, Dispatcher, types
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
+from aiogram.filters import Command, Text, StateFilter
+from aiogram.types import Message, CallbackQuery
+import re
 
-# === КОНФИГ ===
 API_TOKEN = "8385307802:AAE0AJGb8T9RQauVVpLzmFKR1jchrcVZR2c"
 OWNER_ID = 8379101989
 DB_FILENAME = "shifts.db"
@@ -21,12 +15,16 @@ DB_FILENAME = "shifts.db"
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
 
-# === FSM ===
+# FSM
 class ShiftStates(StatesGroup):
     adding_car = State()
     editing_car = State()
+    none = State()
 
-# === БД ===
+class HistoryStates(StatesGroup):
+    browsing = State()
+
+# Инициализация БД
 conn = sqlite3.connect(DB_FILENAME)
 cursor = conn.cursor()
 
@@ -34,7 +32,8 @@ cursor.execute("""
 CREATE TABLE IF NOT EXISTS shifts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     start_time TEXT,
-    end_time TEXT
+    end_time TEXT,
+    total_sum INTEGER
 )
 """)
 
@@ -43,7 +42,8 @@ CREATE TABLE IF NOT EXISTS cars (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     shift_id INTEGER,
     car_number TEXT,
-    total INTEGER
+    sum INTEGER,
+    FOREIGN KEY (shift_id) REFERENCES shifts(id)
 )
 """)
 
@@ -53,243 +53,324 @@ CREATE TABLE IF NOT EXISTS services (
     car_id INTEGER,
     name TEXT,
     count INTEGER,
-    price INTEGER
+    price INTEGER,
+    FOREIGN KEY (car_id) REFERENCES cars(id)
 )
 """)
-
 conn.commit()
 
-# === ВРЕМЯ / ТАРИФ ===
-DAY_START = time(9, 0)
-DAY_END = time(21, 0)
-
-def is_day():
-    now = datetime.now().time()
-    return DAY_START <= now < DAY_END
-
-# === ПРАЙС ===
-
-SERVICES_GROUP_1 = [
-    ("Проверка", 115, 92),
-    ("Заправка", 198, 158),
-    ("Подкачка", 75, 59),
-    ("Заливка омывайки", 66, 55),
-    ("Перегон на СТО", 254, 203),
+# Прайс
+SERVICES = [
+    # Первая страница (самые частые)
+    ("Проверка", 115),
+    ("Заправка", 198),
+    ("Подкачка", 75),
+    ("Заливка омывайки", 66),
+    ("Перегон на СТО", 254),
+    # Вторая страница
+    ("Зарядка АКБ", 125),
+    ("Нет спутника", 398),
+    ("Развоз до 3 часов", 373),
+    ("Развоз до 5 часов", 747),
+    ("Срочка", 220),
+    ("Завершение аренды", 93),
+    ("Проверка ходовой", 115),
+    ("Нестандартная операция", 83),
+    # Третья страница
+    ("Перепарковка ТС", 150),
+    ("Сугроб простой", 160),
+    ("Раскладка документов", 31),
+    ("Чек", 50),
+    ("Перемещение ТС до 20км", 320),
+    ("Проверка ходовой", 115),
+    ("Замена лампочки", 31),
+    ("Закрепление ГРЗ", 31),
+    ("Установка дворника", 74),
+    ("Установка зеркала", 74),
+    ("Заправка из канистры", 278),
+    ("Долив тех. жидкостей", 77),
+    ("Сугроб сложный", 902),
+    ("Удаленная заправка", 545)
 ]
 
-SERVICES_GROUP_2 = [
-    ("Зарядка АКБ", 125, 98),
-    ("Нет спутника", 398, 315),
-    ("Развоз до 3 часов", 373, 295),
-    ("Развоз до 5 часов", 747, 590),
-    ("Срочка", 220, 174),
-    ("Завершение аренды", 93, 74),
-    ("Проверка ходовой", 115, 92),
-    ("Нестандартная операция", 83, 64),
-]
-
-SERVICES_GROUP_3 = [
-    ("Перепарковка ТС", 150, 118),
-    ("Сугроб простой", 160, 128),
-    ("Раскладка документов", 31, 25),
-    ("Чек", 50, 39),
-    ("Перемещение ТС до 20км", 320, 252),
-    ("Замена лампочки", 31, 25),
-    ("Закрепление ГРЗ", 31, 25),
-    ("Установка дворника", 31, 25),
-    ("Установка зеркала", 74, 59),
-    ("Заправка из канистры", 278, 278),
-    ("Долив тех. жидкостей", 77, 66),
-    ("Сугроб сложный", 902, 686),
-    ("Удаленная заправка", 545, 433),
-]
-
-ALL_GROUPS = [SERVICES_GROUP_1, SERVICES_GROUP_2, SERVICES_GROUP_3]
 SERVICES_PER_PAGE = 5
 
-# === НОМЕР АВТО ===
-
-TRANSLIT = str.maketrans({
-    "А": "A", "В": "B", "Е": "E", "К": "K",
-    "М": "M", "Н": "H", "О": "O", "Р": "P",
-    "С": "C", "Т": "T", "У": "Y", "Х": "X"
-})
-
-CAR_REGEX = re.compile(r"^[ABEKMHOPCTYX]\d{3}[ABEKMHOPCTYX]{2}\d{2,3}$")
-
-def normalize_car_number(raw: str):
-    s = raw.upper().replace(" ", "")
-    s = s.translate(TRANSLIT)
-
-    if re.match(r"^[ABEKMHOPCTYX]\d{3}[ABEKMHOPCTYX]{2}$", s):
-        s += "797"
-
-    if not CAR_REGEX.match(s):
-        return None
-
-    return s
-
-# === СМЕНЫ ===
-
+# Функции работы с БД
 def get_active_shift():
-    row = cursor.execute(
-        "SELECT id FROM shifts WHERE end_time IS NULL ORDER BY id DESC LIMIT 1"
-    ).fetchone()
+    cursor.execute("SELECT id FROM shifts WHERE end_time IS NULL ORDER BY id DESC LIMIT 1")
+    row = cursor.fetchone()
     return row[0] if row else None
 
 def open_shift():
-    cursor.execute(
-        "INSERT INTO shifts (start_time) VALUES (datetime('now','localtime'))"
-    )
+    cursor.execute("INSERT INTO shifts (start_time) VALUES (datetime('now','localtime'))")
     conn.commit()
+    return cursor.lastrowid
 
 def close_shift(shift_id):
-    cursor.execute(
-        "UPDATE shifts SET end_time=datetime('now','localtime') WHERE id=?",
-        (shift_id,)
-    )
+    cursor.execute("""
+        SELECT SUM(services.price * services.count)
+        FROM cars 
+        JOIN services ON cars.id = services.car_id 
+        WHERE cars.shift_id = ?
+    """, (shift_id,))
+    total = cursor.fetchone()[0] or 0
+    cursor.execute("""
+        UPDATE shifts
+        SET end_time = datetime('now','localtime'), total_sum = ?
+        WHERE id = ?
+    """, (total, shift_id))
     conn.commit()
+    return total
 
-# === КЛАВИАТУРА ===
+def record_car(shift_id, car_number, services_list):
+    total = 0
+    cursor.execute("INSERT INTO cars (shift_id, car_number, sum) VALUES (?, ?, ?)", (shift_id, car_number, 0))
+    car_id = cursor.lastrowid
+    for name, count, price in services_list:
+        if count > 0:
+            cursor.execute("INSERT INTO services (car_id, name, count, price) VALUES (?, ?, ?, ?)",
+                           (car_id, name, count, price))
+            total += price * count
+    cursor.execute("UPDATE cars SET sum = ? WHERE id = ?", (total, car_id))
+    conn.commit()
+    return total
 
-def shift_keyboard():
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+def format_shift_summary(shift_id):
+    lines = []
+    cursor.execute("SELECT car_number, sum, id FROM cars WHERE shift_id = ?", (shift_id,))
+    cars = cursor.fetchall()
+    total = 0
+    for car_number, car_sum, car_id in cars:
+        lines.append(f"Машина {car_number}: {car_sum} руб.")
+        total += car_sum
+    summary = "\n".join(lines)
+    summary += f"\n\nВсего: {total} руб."
+    return summary
 
-    if get_active_shift():
-        kb.add(KeyboardButton("➕ Добавить машину"))
-        kb.add(KeyboardButton("⛔ Закрыть смену"))
+def format_history_item(shift_id):
+    cursor.execute("SELECT start_time, end_time, total_sum FROM shifts WHERE id = ?", (shift_id,))
+    row = cursor.fetchone()
+    if not row:
+        return "Неизвестная смена"
+    start, end, total = row
+    if end:
+        return f"{start} – {end} (всего {total} руб.)"
     else:
-        kb.add(KeyboardButton("🟢 Открыть смену"))
+        return f"{start} – *активна*"
 
+def find_repeats(shift_id):
+    cursor.execute("SELECT car_number, COUNT(*) FROM cars WHERE shift_id = ? GROUP BY car_number HAVING COUNT(*) > 1", (shift_id,))
+    cars = cursor.fetchall()
+    cursor.execute("""
+        SELECT services.name, SUM(services.count) 
+        FROM cars JOIN services ON cars.id = services.car_id
+        WHERE cars.shift_id = ?
+        GROUP BY services.name
+        HAVING SUM(services.count) > 1
+    """, (shift_id,))
+    services = cursor.fetchall()
+    parts = []
+    if cars:
+        parts.append("Повторяющиеся номера машин:")
+        for car, cnt in cars:
+            parts.append(f"- {car} ({cnt} раза)")
+    if services:
+        parts.append("Повторяющиеся услуги (суммарно):")
+        for name, cnt in services:
+            parts.append(f"- {name}: {cnt} раз")
+    return "\n".join(parts) if parts else "Повторяющихся записей не найдено."
+
+# Клавиатура
+def get_shift_panel():
+    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add(KeyboardButton("➕ Добавить машину"))
+    kb.add(KeyboardButton("📊 Итоги смены"), KeyboardButton("⏱ Информация о смене"))
+    kb.add(KeyboardButton("📜 История смен"))
+    kb.add(KeyboardButton("⛔ Закрыть смену"))
     return kb
 
-# === ХЭНДЛЕРЫ ===
+# Вспомогательная функция для перевода номера в латиницу и добавления региона
+def normalize_car_number(number: str) -> str:
+    mapping = str.maketrans("АВСЕНКМОРТХ", "ABCEHKMOPTX")
+    number = number.upper().translate(mapping)
+    number = re.sub(r"[^A-Z0-9]", "", number)
+    if len(number) <= 6:
+        number += "797"
+    return number
 
-@dp.message(Command("start"))
-async def start(msg: Message):
-    if msg.from_user.id != OWNER_ID:
+# --- Обработчики команд и кнопок ---
+
+@dp.message(Command(commands=["start", "menu"]))
+async def cmd_start(message: Message, state: FSMContext):
+    if message.from_user.id != OWNER_ID:
+        await message.reply("Извините, у вас нет доступа к этому боту.")
         return
-    await msg.answer("Панель управления", reply_markup=shift_keyboard())
+    await state.clear()
+    shift_id = get_active_shift()
+    if shift_id:
+        text = "Смена уже открыта. Панель смены:"
+    else:
+        text = "Добро пожаловать! Смена еще не открыта."
+    await message.answer(text, reply_markup=get_shift_panel())
 
-@dp.message(Text("🟢 Открыть смену"))
-async def open_shift_h(msg: Message):
+@dp.message(Text(equals="Открыть смену"))
+async def open_shift_handler(message: Message):
+    if message.from_user.id != OWNER_ID:
+        return
+    if get_active_shift():
+        await message.answer("Смена уже открыта.", reply_markup=get_shift_panel())
+        return
+    shift_id = open_shift()
+    await message.answer("Смена открыта.", reply_markup=get_shift_panel())
+
+@dp.message(Text(equals="⛔ Закрыть смену"))
+async def close_shift_handler(message: Message):
+    if message.from_user.id != OWNER_ID:
+        return
+    shift_id = get_active_shift()
+    if not shift_id:
+        await message.answer("Смена не открыта.", reply_markup=get_shift_panel())
+        return
+    total = close_shift(shift_id)
+    markup = InlineKeyboardMarkup()
+    markup.add(
+        InlineKeyboardButton(text="💰 Денежный отчёт", callback_data="report_money"),
+        InlineKeyboardButton(text="🔁 Отчёт повторок", callback_data="report_repeats")
+    )
+    await message.answer(f"Смена закрыта. Итого: {total} руб.\nВыберите отчёт:", reply_markup=markup)
+
+# --- Отчеты ---
+@dp.callback_query(Text(equals="report_money"))
+async def report_money_handler(callback: CallbackQuery):
+    shift_id = cursor.execute("SELECT id FROM shifts WHERE end_time IS NOT NULL ORDER BY id DESC LIMIT 1").fetchone()[0]
+    text = format_shift_summary(shift_id)
+    await callback.message.answer("💰 Денежный отчёт:\n" + text)
+    await callback.answer()
+
+@dp.callback_query(Text(equals="report_repeats"))
+async def report_repeats_handler(callback: CallbackQuery):
+    shift_id = cursor.execute("SELECT id FROM shifts WHERE end_time IS NOT NULL ORDER BY id DESC LIMIT 1").fetchone()[0]
+    text = find_repeats(shift_id)
+    await callback.message.answer("🔁 Отчёт повторок:\n" + text)
+    await callback.answer()
+
+# --- История смен ---
+@dp.message(Text(equals="📜 История смен"))
+async def history_handler(message: Message, state: FSMContext):
+    if message.from_user.id != OWNER_ID:
+        return
+    await state.set_state(HistoryStates.browsing)
+    cursor.execute("SELECT id FROM shifts ORDER BY id DESC")
+    shifts = cursor.fetchall()
+    if not shifts:
+        await message.answer("История пуста.", reply_markup=get_shift_panel())
+        await state.clear()
+        return
+    markup = InlineKeyboardMarkup(row_width=1)
+    for (sid,) in shifts:
+        label = format_history_item(sid)
+        markup.add(InlineKeyboardButton(text=label, callback_data=f"hist_{sid}"))
+    await message.answer("Выберите смену:", reply_markup=markup)
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("hist_"), state=HistoryStates.browsing)
+async def history_view_handler(callback: CallbackQuery, state: FSMContext):
+    _, sid_str = callback.data.split("_")
+    sid = int(sid_str)
+    cursor.execute("SELECT start_time, end_time, total_sum FROM shifts WHERE id = ?", (sid,))
+    row = cursor.fetchone()
+    text = f"Смена {sid}:\n"
+    if row:
+        start, end, total = row
+        text += f"Начало: {start}\nКонец: {end}\nИтог: {total or 0} руб.\n\n"
+        cursor.execute("SELECT car_number, sum, id FROM cars WHERE shift_id = ?", (sid,))
+        cars = cursor.fetchall()
+        if cars:
+            text += "Машины:\n"
+            for car_number, car_sum, car_id in cars:
+                text += f"- {car_number}: {car_sum} руб.\n"
+                cursor.execute("SELECT name, count FROM services WHERE car_id = ?", (car_id,))
+                services = cursor.fetchall()
+                for name, count in services:
+                    text += f"    • {name} ×{count}\n"
+        else:
+            text += "Нет машин.\n"
+    markup = InlineKeyboardMarkup().add(InlineKeyboardButton("Назад", callback_data="hist_back"))
+    await callback.message.answer(text, reply_markup=markup)
+    await callback.answer()
+
+@dp.callback_query(Text(equals="hist_back"), state=HistoryStates.browsing)
+async def history_back_handler(callback: CallbackQuery):
+    await callback.message.delete()
+    cursor.execute("SELECT id FROM shifts ORDER BY id DESC")
+    shifts = cursor.fetchall()
+    markup = InlineKeyboardMarkup(row_width=1)
+    for (sid,) in shifts:
+        label = format_history_item(sid)
+        markup.add(InlineKeyboardButton(text=label, callback_data=f"hist_{sid}"))
+    await callback.message.answer("Выберите смену:", reply_markup=markup)
+    await callback.answer()
+
+# --- Информация о смене ---
+@dp.message(Text(equals="⏱ Информация о смене"))
+async def shift_info_handler(message: Message):
+    if message.from_user.id != OWNER_ID:
+        return
+    shift_id = get_active_shift()
+    if not shift_id:
+        await message.answer("Смена не открыта.", reply_markup=get_shift_panel())
+        return
+    cursor.execute("SELECT start_time FROM shifts WHERE id = ?", (shift_id,))
+    start = cursor.fetchone()[0]
+    cursor.execute("SELECT (strftime('%s', 'now') - strftime('%s', start_time)) FROM shifts WHERE id = ?", (shift_id,))
+    seconds = cursor.fetchone()[0]
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    await message.answer(f"Смена открыта: {start}\nДлительность: {hours} ч {minutes} мин.", reply_markup=get_shift_panel())
+
+# --- Итоги смены без закрытия ---
+@dp.message(Text(equals="📊 Итоги смены"))
+async def interim_report_handler(message: Message):
+    if message.from_user.id != OWNER_ID:
+        return
+    shift_id = get_active_shift()
+    if not shift_id:
+        await message.answer("Смена не открыта.", reply_markup=get_shift_panel())
+        return
+    summary = format_shift_summary(shift_id)
+    await message.answer("📊 Итоги текущей смены:\n" + summary, reply_markup=get_shift_panel())
+
+# --- Добавление машины ---
+@dp.message(Text(equals="➕ Добавить машину"))
+async def add_car_start(message: Message, state: FSMContext):
+    if message.from_user.id != OWNER_ID:
+        return
     if not get_active_shift():
-        open_shift()
-    await msg.answer("Смена открыта", reply_markup=shift_keyboard())
-
-@dp.message(Text("⛔ Закрыть смену"))
-async def close_shift_h(msg: Message):
-    shift = get_active_shift()
-    if shift:
-        close_shift(shift)
-    await msg.answer("Смена закрыта", reply_markup=shift_keyboard())
-
-@dp.message(Text("➕ Добавить машину"))
-async def add_car(msg: Message, state: FSMContext):
+        await message.answer("Смена не открыта.", reply_markup=get_shift_panel())
+        return
     await state.set_state(ShiftStates.adding_car)
-    await msg.answer("Введите номер автомобиля")
+    await message.answer("Введите номер машины (или /cancel):")
 
 @dp.message(ShiftStates.adding_car)
-async def car_number(msg: Message, state: FSMContext):
-    norm = normalize_car_number(msg.text)
-    if not norm:
-        await msg.answer("Неверный номер. Введите снова")
-        return
-
-    await state.update_data(car=norm, services={})
+async def add_car_number(message: Message, state: FSMContext):
+    car_number = normalize_car_number(message.text.strip())
+    await state.update_data(car_number=car_number, services={}, delete_mode=False)
     await state.set_state(ShiftStates.editing_car)
-    await show_services(msg, state, 0, 0)
+    await show_services_page(message, state, page=0)
 
-# === УСЛУГИ ===
-
-async def show_services(target, state, group, page):
-    data = await state.get_data()
-    services = data["services"]
-
-    group_data = ALL_GROUPS[group]
-    start = page * SERVICES_PER_PAGE
-    chunk = group_data[start:start + SERVICES_PER_PAGE]
-
-    kb = InlineKeyboardMarkup()
-
-    for name, day, night in chunk:
-        price = day if is_day() else night
-        count = services.get(name, 0)
-        kb.add(
-            InlineKeyboardButton(
-                text=f"{name} ({price}) [{count}]",
-                callback_data=f"svc:{group}:{page}:{name}"
-            )
-        )
-
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton("⬅", callback_data=f"page:{group}:{page-1}"))
-    if start + SERVICES_PER_PAGE < len(group_data):
-        nav.append(InlineKeyboardButton("➡", callback_data=f"page:{group}:{page+1}"))
-    if nav:
-        kb.row(*nav)
-
-    if group + 1 < len(ALL_GROUPS):
-        kb.add(InlineKeyboardButton("Следующая группа", callback_data=f"group:{group+1}"))
-
-    kb.add(InlineKeyboardButton("✅ Готово", callback_data="done"))
-
-    await target.answer("Выберите услуги", reply_markup=kb)
-
-@dp.callback_query(Text(startswith="svc:"))
-async def svc_add(cb: CallbackQuery, state: FSMContext):
-    _, g, p, name = cb.data.split(":")
-    data = await state.get_data()
-    services = data["services"]
-    services[name] = services.get(name, 0) + 1
-    await state.update_data(services=services)
-    await cb.message.delete()
-    await show_services(cb.message, state, int(g), int(p))
-    await cb.answer()
-
-@dp.callback_query(Text(startswith="page:"))
-async def page(cb: CallbackQuery, state: FSMContext):
-    _, g, p = cb.data.split(":")
-    await cb.message.delete()
-    await show_services(cb.message, state, int(g), int(p))
-    await cb.answer()
-
-@dp.callback_query(Text(startswith="group:"))
-async def group(cb: CallbackQuery, state: FSMContext):
-    _, g = cb.data.split(":")
-    await cb.message.delete()
-    await show_services(cb.message, state, int(g), 0)
-    await cb.answer()
-
-@dp.callback_query(Text("done"))
-async def done(cb: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    car = data["car"]
-    services = data["services"]
-
-    shift = get_active_shift()
-    cursor.execute("INSERT INTO cars (shift_id, car_number, total) VALUES (?,?,0)", (shift, car))
-    car_id = cursor.lastrowid
-
-    total = 0
-    for name, cnt in services.items():
-        price = next(
-            (d if is_day() else n for g in ALL_GROUPS for (nme, d, n) in g if nme == name),
-            0
-        )
-        cursor.execute(
-            "INSERT INTO services (car_id,name,count,price) VALUES (?,?,?,?)",
-            (car_id, name, cnt, price)
-        )
-        total += cnt * price
-
-    cursor.execute("UPDATE cars SET total=? WHERE id=?", (total, car_id))
-    conn.commit()
-
+@dp.message(Command(commands=["cancel"]), StateFilter(ShiftStates))
+async def cancel_handler(message: Message, state: FSMContext):
+    if message.from_user.id != OWNER_ID:
+        return
     await state.clear()
-    await cb.message.answer(f"{car} сохранена\nИтого: {total}", reply_markup=shift_keyboard())
-    await cb.answer()
+    await message.answer("Действие отменено.", reply_markup=get_shift_panel())
+
+# --- Запуск бота ---
+@dp.message()
+async def default_handler(message: Message):
+    if message.from_user.id != OWNER_ID:
+        return
+    await message.answer("Используйте кнопки меню.", reply_markup=get_shift_panel())
 
 if __name__ == "__main__":
+    print("Бот запущен...")
     dp.run_polling(bot)
