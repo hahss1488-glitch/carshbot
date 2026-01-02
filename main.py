@@ -6,13 +6,18 @@ from datetime import datetime
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
-    Message, CallbackQuery,
-    ReplyKeyboardMarkup, KeyboardButton,
-    InlineKeyboardMarkup, InlineKeyboardButton
+    Message,
+    CallbackQuery,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    ReplyKeyboardRemove
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # ======================
@@ -28,7 +33,7 @@ DEFAULT_REGION = "797"
 # БОТ
 # ======================
 
-bot = Bot(API_TOKEN)
+bot = Bot(token=API_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 # ======================
@@ -78,7 +83,6 @@ CREATE TABLE IF NOT EXISTS services (
 """)
 
 conn.commit()
-
 # ======================
 # УСЛУГИ (ПОЛНЫЙ ПРАЙС)
 # ======================
@@ -115,9 +119,10 @@ SERVICES = [
 ]
 
 SERVICES_PER_PAGE = 5
+SERVICE_PRICE = dict(SERVICES)
 
 # ======================
-# УТИЛИТЫ
+# НОРМАЛИЗАЦИЯ НОМЕРОВ
 # ======================
 
 CYR_TO_LAT = {
@@ -127,6 +132,9 @@ CYR_TO_LAT = {
 }
 
 def normalize_car_number(raw: str) -> str | None:
+    if not raw:
+        return None
+
     raw = raw.upper().replace(" ", "")
     result = ""
 
@@ -140,15 +148,20 @@ def normalize_car_number(raw: str) -> str | None:
         else:
             return None
 
+    # если регион не указан
     if len(result) in (5, 6):
         result += DEFAULT_REGION
 
-    if not re.match(r"^[A-Z]\d{3}[A-Z]{2}\d{3}$", result):
+    if not re.fullmatch(r"[A-Z]\d{3}[A-Z]{2}\d{3}", result):
         return None
 
     return result
 
-def get_active_shift():
+# ======================
+# РАБОТА СО СМЕНОЙ
+# ======================
+
+def get_active_shift() -> int | None:
     cursor.execute(
         "SELECT id FROM shifts WHERE end_time IS NULL ORDER BY id DESC LIMIT 1"
     )
@@ -175,69 +188,114 @@ def close_shift_logic(shift_id: int) -> int:
         UPDATE shifts
         SET end_time = ?, total_sum = ?
         WHERE id = ?
-    """, (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), total, shift_id))
+    """, (
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        total,
+        shift_id
+    ))
     conn.commit()
-
     return total
+
 # ======================
 # КЛАВИАТУРЫ
 # ======================
 
-def get_main_menu(active_shift: bool):
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    if active_shift:
-        kb.add(KeyboardButton("➕ Добавить машину"))
-        kb.add(KeyboardButton("📊 Итоги смены"), KeyboardButton("⏱ Информация о смене"))
-        kb.add(KeyboardButton("📜 История смен"))
-        kb.add(KeyboardButton("⛔ Закрыть смену"))
-    else:
-        kb.add(KeyboardButton("Открыть смену"))
-    return kb
+def get_main_menu(active_shift: bool) -> ReplyKeyboardMarkup:
+    keyboard = []
 
-def services_keyboard(page: int, selected: dict, delete_mode: bool):
+    if active_shift:
+        keyboard.extend([
+            [KeyboardButton(text="➕ Добавить машину")],
+            [
+                KeyboardButton(text="📊 Итоги смены"),
+                KeyboardButton(text="⏱ Информация о смене")
+            ],
+            [KeyboardButton(text="📜 История смен")],
+            [KeyboardButton(text="⛔ Закрыть смену")]
+        ])
+    else:
+        keyboard.append([KeyboardButton(text="Открыть смену")])
+
+    return ReplyKeyboardMarkup(
+        keyboard=keyboard,
+        resize_keyboard=True
+    )
+
+def services_keyboard(page: int, selected: dict, delete_mode: bool) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
+
     start = page * SERVICES_PER_PAGE
     end = start + SERVICES_PER_PAGE
     chunk = SERVICES[start:end]
 
-    for name, price in chunk:
-        cnt = selected.get(name, 0)
-        label = f"{name} ({cnt})"
-        kb.button(text=label, callback_data=f"svc|{page}|{name}")
+    for name, _ in chunk:
+        count = selected.get(name, 0)
+        text = f"{name} ({count})"
+        kb.button(
+            text=text,
+            callback_data=f"svc|{page}|{name}"
+        )
 
-    # Навигация страниц
-    nav = []
+    nav_row = []
     if start > 0:
-        nav.append(InlineKeyboardButton("⬅️", callback_data=f"page|{page-1}"))
+        nav_row.append(
+            InlineKeyboardButton(text="⬅️", callback_data=f"page|{page - 1}")
+        )
     if end < len(SERVICES):
-        nav.append(InlineKeyboardButton("➡️", callback_data=f"page|{page+1}"))
-    if nav:
-        kb.row(*nav)
+        nav_row.append(
+            InlineKeyboardButton(text="➡️", callback_data=f"page|{page + 1}")
+        )
+
+    if nav_row:
+        kb.row(*nav_row)
 
     kb.row(
         InlineKeyboardButton(
-            "🗑 Удаление: ВКЛ" if delete_mode else "🗑 Удаление: ВЫКЛ",
+            text="🗑 Удаление: ВКЛ" if delete_mode else "🗑 Удаление: ВЫКЛ",
             callback_data="toggle_delete"
         )
     )
 
     kb.row(
-        InlineKeyboardButton("✅ Готово", callback_data="done")
+        InlineKeyboardButton(
+            text="✅ Готово",
+            callback_data="done"
+        )
     )
 
     return kb.as_markup()
+# ======================
+# FSM СОСТОЯНИЯ
+# ======================
+
+class ShiftStates(StatesGroup):
+    adding_car = State()
+    editing_car = State()
+
+class HistoryStates(StatesGroup):
+    browsing = State()
 
 # ======================
 # СТАРТ / МЕНЮ
 # ======================
 
-@dp.message(F.text.in_({"start", "menu"}))
+@dp.message(F.text.in_({"/start", "menu"}))
 async def start_cmd(message: Message, state: FSMContext):
     if message.from_user.id != OWNER_ID:
         return
+
     await state.clear()
     active = bool(get_active_shift())
-    await message.answer("Панель смены", reply_markup=get_main_menu(active))
+
+    text = (
+        "Панель смены\n"
+        + ("🟢 Смена открыта" if active else "🔴 Смена не открыта")
+    )
+
+    await message.answer(
+        text,
+        reply_markup=get_main_menu(active)
+    )
 
 # ======================
 # ОТКРЫТИЕ СМЕНЫ
@@ -247,11 +305,20 @@ async def start_cmd(message: Message, state: FSMContext):
 async def open_shift_handler(message: Message):
     if message.from_user.id != OWNER_ID:
         return
+
     if get_active_shift():
-        await message.answer("Смена уже открыта")
+        await message.answer(
+            "Смена уже открыта",
+            reply_markup=get_main_menu(True)
+        )
         return
+
     open_shift()
-    await message.answer("Смена открыта", reply_markup=get_main_menu(True))
+
+    await message.answer(
+        "✅ Смена открыта",
+        reply_markup=get_main_menu(True)
+    )
 
 # ======================
 # ЗАКРЫТИЕ СМЕНЫ
@@ -261,20 +328,32 @@ async def open_shift_handler(message: Message):
 async def close_shift_handler(message: Message):
     if message.from_user.id != OWNER_ID:
         return
+
     shift_id = get_active_shift()
     if not shift_id:
-        await message.answer("Нет активной смены")
+        await message.answer(
+            "Нет активной смены",
+            reply_markup=get_main_menu(False)
+        )
         return
+
     total = close_shift_logic(shift_id)
 
     kb = InlineKeyboardBuilder()
     kb.button(text="💰 Денежный отчёт", callback_data="report_money")
     kb.button(text="🔁 Повторки", callback_data="report_repeat")
+    kb.adjust(1)
 
     await message.answer(
-        f"Смена закрыта\nИтого: {total} ₽",
+        f"⛔ Смена закрыта\n💰 Итого: {total} ₽",
         reply_markup=kb.as_markup()
     )
+
+    await message.answer(
+        "Главное меню",
+        reply_markup=get_main_menu(False)
+    )
+
 # ======================
 # ДОБАВЛЕНИЕ МАШИНЫ
 # ======================
@@ -282,57 +361,91 @@ async def close_shift_handler(message: Message):
 @dp.message(F.text == "➕ Добавить машину")
 async def add_car_start(message: Message, state: FSMContext):
     if not get_active_shift():
-        await message.answer("Сначала открой смену")
+        await message.answer(
+            "Сначала открой смену",
+            reply_markup=get_main_menu(False)
+        )
         return
+
     await state.set_state(ShiftStates.adding_car)
+
     await message.answer(
-        "Введи номер ТС (можно кириллицей, без региона)",
-        reply_markup=ReplyKeyboardRemove()
+        "Введи номер машины\n"
+        "Можно кириллицей, без региона",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="❌ Отмена")]],
+            resize_keyboard=True
+        )
     )
 
 @dp.message(ShiftStates.adding_car)
 async def add_car_number(message: Message, state: FSMContext):
-    normalized = normalize_car_number(message.text)
-    if not normalized:
-        await message.answer("❌ Неверный номер, попробуй ещё раз")
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await message.answer(
+            "Отменено",
+            reply_markup=get_main_menu(True)
+        )
         return
+
+    number = normalize_car_number(message.text)
+    if not number:
+        await message.answer(
+            "❌ Неверный номер\nПопробуй ещё раз"
+        )
+        return
+
     await state.update_data(
-        car_number=normalized,
+        car_number=number,
         services={},
         page=0,
         delete_mode=False
     )
+
     await state.set_state(ShiftStates.editing_car)
+
     await message.answer(
-        f"🚗 Машина {normalized}\nВыбери услуги:",
+        f"🚗 Машина: {number}\nВыбери услуги",
         reply_markup=services_keyboard(0, {}, False)
     )
 
 # ======================
-# НАВИГАЦИЯ УСЛУГ
+# НАВИГАЦИЯ ПО УСЛУГАМ
 # ======================
 
 @dp.callback_query(F.data.startswith("page|"), ShiftStates.editing_car)
-async def change_page(call: CallbackQuery, state: FSMContext):
+async def change_services_page(call: CallbackQuery, state: FSMContext):
     page = int(call.data.split("|")[1])
     data = await state.get_data()
+
     await state.update_data(page=page)
+
     await call.message.edit_reply_markup(
-        reply_markup=services_keyboard(page, data["services"], data["delete_mode"])
+        reply_markup=services_keyboard(
+            page,
+            data["services"],
+            data["delete_mode"]
+        )
     )
     await call.answer()
 
 # ======================
-# ПЕРЕКЛЮЧЕНИЕ УДАЛЕНИЯ
+# РЕЖИМ УДАЛЕНИЯ
 # ======================
 
 @dp.callback_query(F.data == "toggle_delete", ShiftStates.editing_car)
-async def toggle_delete(call: CallbackQuery, state: FSMContext):
+async def toggle_delete_mode(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     delete_mode = not data["delete_mode"]
+
     await state.update_data(delete_mode=delete_mode)
+
     await call.message.edit_reply_markup(
-        reply_markup=services_keyboard(data["page"], data["services"], delete_mode)
+        reply_markup=services_keyboard(
+            data["page"],
+            data["services"],
+            delete_mode
+        )
     )
     await call.answer()
 
@@ -344,17 +457,30 @@ async def toggle_delete(call: CallbackQuery, state: FSMContext):
 async def select_service(call: CallbackQuery, state: FSMContext):
     _, page, name = call.data.split("|")
     page = int(page)
+
     data = await state.get_data()
     services = data["services"]
     delete_mode = data["delete_mode"]
-    count = services.get(name, 0)
-    services[name] = max(0, count - 1) if delete_mode else count + 1
-    await state.update_data(services=services)
-    await call.message.edit_reply_markup(
-        reply_markup=services_keyboard(page, services, delete_mode)
-    )
-    await call.answer(f"{name}: {services[name]}")
 
+    current = services.get(name, 0)
+
+    if delete_mode:
+        if current > 0:
+            services[name] = current - 1
+    else:
+        services[name] = current + 1
+
+    await state.update_data(services=services)
+
+    await call.message.edit_reply_markup(
+        reply_markup=services_keyboard(
+            page,
+            services,
+            delete_mode
+        )
+    )
+
+    await call.answer(f"{name}: {services.get(name,0)}")
 # ======================
 # СОХРАНЕНИЕ МАШИНЫ
 # ======================
@@ -362,9 +488,15 @@ async def select_service(call: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "done", ShiftStates.editing_car)
 async def save_car(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
+
     car_number = data["car_number"]
     services = data["services"]
     shift_id = get_active_shift()
+
+    if not shift_id:
+        await call.answer("Смена не найдена", show_alert=True)
+        await state.clear()
+        return
 
     cursor.execute(
         "INSERT INTO cars (shift_id, car_number, sum) VALUES (?, ?, 0)",
@@ -372,24 +504,164 @@ async def save_car(call: CallbackQuery, state: FSMContext):
     )
     car_id = cursor.lastrowid
 
+    service_prices = dict(SERVICES)
     total = 0
-    service_dict = dict(SERVICES)
-    for name, count in services.items():
-        if count > 0:
-            price = service_dict[name]
-            cursor.execute(
-                "INSERT INTO services (car_id, name, count, price) VALUES (?, ?, ?, ?)",
-                (car_id, name, count, price)
-            )
-            total += price * count
 
-    cursor.execute("UPDATE cars SET sum = ? WHERE id = ?", (total, car_id))
+    for name, count in services.items():
+        if count <= 0:
+            continue
+        price = service_prices.get(name, 0)
+        cursor.execute(
+            "INSERT INTO services (car_id, name, count, price) VALUES (?, ?, ?, ?)",
+            (car_id, name, count, price)
+        )
+        total += price * count
+
+    cursor.execute(
+        "UPDATE cars SET sum = ? WHERE id = ?",
+        (total, car_id)
+    )
     conn.commit()
+
     await state.clear()
+
     await call.message.answer(
-        f"✅ Машина сохранена\n{car_number}\nИтого: {total} ₽",
+        f"✅ Машина сохранена\n"
+        f"🚗 {car_number}\n"
+        f"💰 {total} ₽",
         reply_markup=get_main_menu(True)
     )
+    await call.answer()
+
+# ======================
+# ИТОГИ ТЕКУЩЕЙ СМЕНЫ
+# ======================
+
+@dp.message(F.text == "📊 Итоги смены")
+async def shift_totals(message: Message):
+    shift_id = get_active_shift()
+    if not shift_id:
+        await message.answer(
+            "Смена не открыта",
+            reply_markup=get_main_menu(False)
+        )
+        return
+
+    cursor.execute(
+        "SELECT car_number, sum FROM cars WHERE shift_id=?",
+        (shift_id,)
+    )
+    cars = cursor.fetchall()
+
+    if not cars:
+        await message.answer("Машин пока нет")
+        return
+
+    total = 0
+    text = "📊 Итоги смены:\n\n"
+
+    for car, s in cars:
+        text += f"🚗 {car}: {s} ₽\n"
+        total += s
+
+    text += f"\n💰 ИТОГО: {total} ₽"
+
+    await message.answer(text)
+
+# ======================
+# ИНФОРМАЦИЯ О СМЕНЕ
+# ======================
+
+@dp.message(F.text == "⏱ Информация о смене")
+async def shift_info(message: Message):
+    shift_id = get_active_shift()
+    if not shift_id:
+        await message.answer(
+            "Смена не открыта",
+            reply_markup=get_main_menu(False)
+        )
+        return
+
+    cursor.execute(
+        "SELECT start_time FROM shifts WHERE id=?",
+        (shift_id,)
+    )
+    start_time = cursor.fetchone()[0]
+    start_dt = datetime.strptime(start_time, "%Y-%m-%d %H:%M:%S")
+    delta = datetime.now() - start_dt
+
+    hours, remainder = divmod(delta.seconds, 3600)
+    minutes = remainder // 60
+
+    cursor.execute(
+        "SELECT COUNT(*) FROM cars WHERE shift_id=?",
+        (shift_id,)
+    )
+    car_count = cursor.fetchone()[0]
+
+    cursor.execute(
+        "SELECT SUM(sum) FROM cars WHERE shift_id=?",
+        (shift_id,)
+    )
+    total = cursor.fetchone()[0] or 0
+
+    await message.answer(
+        "⏱ Информация о смене\n\n"
+        f"🕒 Начало: {start_time}\n"
+        f"⏳ Длительность: {hours} ч {minutes} мин\n"
+        f"🚗 Машин: {car_count}\n"
+        f"💰 Сумма: {total} ₽"
+    )
+
+# ======================
+# INLINE ОТЧЁТЫ ПОСЛЕ ЗАКРЫТИЯ
+# ======================
+
+@dp.callback_query(F.data == "report_money")
+async def report_money(call: CallbackQuery):
+    cursor.execute("SELECT id FROM shifts ORDER BY id DESC LIMIT 1")
+    shift_id = cursor.fetchone()[0]
+
+    cursor.execute(
+        "SELECT car_number, sum FROM cars WHERE shift_id=?",
+        (shift_id,)
+    )
+    cars = cursor.fetchall()
+
+    text = "💰 Денежный отчёт:\n\n"
+    total = 0
+
+    for car, s in cars:
+        text += f"{car}: {s} ₽\n"
+        total += s
+
+    text += f"\nИТОГО: {total} ₽"
+
+    await call.message.answer(text)
+    await call.answer()
+
+@dp.callback_query(F.data == "report_repeat")
+async def report_repeat(call: CallbackQuery):
+    cursor.execute(
+        """
+        SELECT car_number, COUNT(*)
+        FROM cars
+        GROUP BY car_number
+        HAVING COUNT(*) > 1
+        """
+    )
+    cars = cursor.fetchall()
+
+    if not cars:
+        await call.message.answer("Повторов нет")
+        await call.answer()
+        return
+
+    text = "🔁 Повторы:\n\n"
+    for car, cnt in cars:
+        text += f"{car}: {cnt} раз\n"
+
+    await call.message.answer(text)
     await call.answer()
 # ======================
 # ИСТОРИЯ СМЕН
@@ -397,93 +669,79 @@ async def save_car(call: CallbackQuery, state: FSMContext):
 
 @dp.message(F.text == "📜 История смен")
 async def history_list(message: Message, state: FSMContext):
-    cursor.execute("SELECT id, start_time, end_time, total_sum FROM shifts ORDER BY id DESC")
+    cursor.execute(
+        "SELECT id, start_time, end_time, total_sum FROM shifts ORDER BY id DESC"
+    )
     rows = cursor.fetchall()
+
     if not rows:
-        await message.answer("История смен пуста", reply_markup=get_main_menu(bool(get_active_shift())))
+        await message.answer(
+            "История смен пуста",
+            reply_markup=get_main_menu(bool(get_active_shift()))
+        )
         return
 
-    from aiogram.utils.keyboard import InlineKeyboardBuilder
     kb = InlineKeyboardBuilder()
     for sid, start, end, total in rows:
-        label = f"{start[:16]}"
-        label += f" | {total} ₽" if end else " | АКТИВНА"
+        label = start[:16]
+        if end:
+            label += f" | {total or 0} ₽"
+        else:
+            label += " | АКТИВНА"
         kb.button(text=label, callback_data=f"hist|{sid}")
+
     kb.adjust(1)
     await message.answer("Выбери смену:", reply_markup=kb.as_markup())
     await state.set_state(HistoryStates.browsing)
 
+
 @dp.callback_query(F.data.startswith("hist|"), HistoryStates.browsing)
 async def history_view(call: CallbackQuery):
     sid = int(call.data.split("|")[1])
-    cursor.execute("SELECT start_time, end_time, total_sum FROM shifts WHERE id=?", (sid,))
+
+    cursor.execute(
+        "SELECT start_time, end_time, total_sum FROM shifts WHERE id=?",
+        (sid,)
+    )
     shift = cursor.fetchone()
+
     text = (
-        f"🕒 Смена {sid}\n"
+        f"🕒 Смена #{sid}\n"
         f"Начало: {shift[0]}\n"
         f"Конец: {shift[1] or '—'}\n"
         f"Итого: {shift[2] or 0} ₽\n\n"
     )
 
-    cursor.execute("SELECT id, car_number, sum FROM cars WHERE shift_id=?", (sid,))
+    cursor.execute(
+        "SELECT id, car_number, sum FROM cars WHERE shift_id=?",
+        (sid,)
+    )
     cars = cursor.fetchall()
+
     if not cars:
         text += "Машин нет"
     else:
         for cid, car, s in cars:
             text += f"🚗 {car} — {s} ₽\n"
-            cursor.execute("SELECT name, count FROM services WHERE car_id=?", (cid,))
-            for n, c in cursor.fetchall():
-                text += f"  • {n} ×{c}\n"
+            cursor.execute(
+                "SELECT name, count FROM services WHERE car_id=?",
+                (cid,)
+            )
+            for name, cnt in cursor.fetchall():
+                text += f"  • {name} ×{cnt}\n"
 
     kb = InlineKeyboardBuilder()
     kb.button(text="⬅️ Назад", callback_data="hist_back")
+
     await call.message.answer(text, reply_markup=kb.as_markup())
     await call.answer()
+
 
 @dp.callback_query(F.data == "hist_back")
 async def history_back(call: CallbackQuery):
     await call.message.delete()
     await call.answer()
 
-# ======================
-# ПОВТОРКИ
-# ======================
-
-@dp.callback_query(F.data == "report_repeats")
-async def report_repeats(call: CallbackQuery):
-    cursor.execute("""
-        SELECT car_number, COUNT(*)
-        FROM cars
-        GROUP BY car_number
-        HAVING COUNT(*) > 1
-    """)
-    cars = cursor.fetchall()
-
-    cursor.execute("""
-        SELECT name, SUM(count)
-        FROM services
-        GROUP BY name
-        HAVING SUM(count) > 1
-    """)
-    services = cursor.fetchall()
-
-    text = "🔁 ПОВТОРЫ\n\n"
-    if cars:
-        text += "🚗 Машины:\n"
-        for c, n in cars:
-            text += f"- {c} ×{n}\n"
-
-    if services:
-        text += "\n🛠 Услуги:\n"
-        for s, n in services:
-            text += f"- {s} ×{n}\n"
-
-    if not cars and not services:
-        text += "Повторов нет"
-
-    await call.message.answer(text)
-    await call.answer()
 
 # ======================
 # ОТМЕНА FSM
@@ -492,15 +750,16 @@ async def report_repeats(call: CallbackQuery):
 from aiogram.filters import Command
 
 @dp.message(Command("cancel"))
-async def cancel(message: Message, state: FSMContext):
+async def cancel_handler(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(
         "Действие отменено",
         reply_markup=get_main_menu(bool(get_active_shift()))
     )
 
+
 # ======================
-# ОБРАБОТКА НЕИЗВЕСТНЫХ СООБЩЕНИЙ
+# FALLBACK
 # ======================
 
 @dp.message()
@@ -510,14 +769,15 @@ async def fallback(message: Message):
         reply_markup=get_main_menu(bool(get_active_shift()))
     )
 
+
 # ======================
-# ЗАПУСК БОТА
+# ЗАПУСК
 # ======================
 
 async def main():
     print("🚀 Бот запущен")
     await dp.start_polling(bot)
 
+
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(main())
