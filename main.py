@@ -1,3 +1,6 @@
+BASE_DIR = os.getcwd()
+DB_FILE = os.path.join(BASE_DIR, "shifts.db")
+
 import asyncio
 import sqlite3
 import os
