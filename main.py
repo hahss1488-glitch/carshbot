@@ -23,7 +23,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 # КОНФИГ
 # ======================
 
-API_TOKEN = os.getenv("BOT_TOKEN") or "PUT_YOUR_TOKEN_HERE"
+API_TOKEN = os.getenv("BOT_TOKEN") or "8385307802:AAE0AJGb8T9RQauVVpLzmFKR1jchrcVZR2c"
 OWNER_ID = 8379101989
 
 DB_FILE = "shifts.db"
