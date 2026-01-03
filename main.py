@@ -29,7 +29,7 @@ logging.basicConfig(level=logging.INFO)
 # ======================
 # КОНФИГ
 # ======================
-BOT_TOKEN = "ВСТАВЬ_СЮДА_ТОКЕН"
+BOT_TOKEN = "8385307802:AAE0AJGb8T9RQauVVpLzmFKR1jchrcVZR2c"
 OWNER_ID = 8379101989
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
